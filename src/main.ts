@@ -79,17 +79,23 @@ async function analyzeCode(
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
+  return `You are an expert code reviewer focused on identifying significant issues, potential bugs, and architectural improvements. Instructions:
+
+- Provide the response in following JSON format: {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review comment>"}]}
+- Focus ONLY on these categories:
+  1. Potential bugs, race conditions, or error handling issues
+  2. Security vulnerabilities or data safety concerns
+  3. Performance issues or scalability concerns
+  4. Architectural improvements that could significantly impact maintainability
+  5. Business logic concerns or edge cases that might be missed
+- Ignore minor style issues, formatting, or documentation suggestions
+- Only provide comments when you identify substantial issues that could impact code quality, security, or reliability
+- Write comments in GitHub Markdown format
+- Be direct and specific about the potential impact of each issue
 
 Review the following code diff in the file "${
     file.to
-  }" and take the pull request title and description into account when writing the response.
+  }" considering the pull request context:
   
 Pull request title: ${prDetails.title}
 Pull request description:
@@ -115,24 +121,26 @@ async function getAIResponse(prompt: string): Promise<Array<{
   reviewComment: string;
 }> | null> {
   const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.2,
-    max_tokens: 700,
+    model: "gpt-4o-2024-11-20",
+    temperature: 0.1,
+    max_tokens: 1000,
     top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
+    frequency_penalty: 0.1,
+    presence_penalty: 0.1,
   };
 
   try {
     const response = await openai.chat.completions.create({
       ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
+      response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
+          content:
+            "You are an expert code reviewer focused on identifying significant issues that could impact code quality, security, or reliability. Avoid minor stylistic suggestions.",
+        },
+        {
+          role: "user",
           content: prompt,
         },
       ],
