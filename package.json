@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc",
     "package": "ncc build --source-map --license licenses.txt",
+    "prepare": "yarn build && yarn package",
     "format": "prettier --write .",
     "lint": "prettier --check .",
     "test": "jest"

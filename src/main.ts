@@ -2,7 +2,7 @@ import { readFileSync } from "fs";
 import * as core from "@actions/core";
 import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, { Chunk, File } from "parse-diff";
+import parseDiff, { Chunk, File, Change } from "parse-diff";
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
@@ -56,42 +56,91 @@ async function getDiff(
   return response.data;
 }
 
-async function analyzeCode(
-  parsedDiff: File[],
-  prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+async function getFileContent(
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string
+): Promise<string | null> {
+  try {
+    const response = await octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref,
+    });
 
-  for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
-    for (const chunk of file.chunks) {
-      const prompt = createPrompt(file, chunk, prDetails);
-      const aiResponse = await getAIResponse(prompt);
-      if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
-          comments.push(...newComments);
-        }
-      }
+    if (
+      "content" in response.data &&
+      typeof response.data.content === "string"
+    ) {
+      return Buffer.from(response.data.content, "base64").toString();
     }
+    return null;
+  } catch (error) {
+    console.error(`Error fetching file content: ${error}`);
+    return null;
   }
-  return comments;
 }
 
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `You are an expert code reviewer focused on identifying significant issues, potential bugs, and architectural improvements. Instructions:
+// Helper function to get line number from a Change
+function getLineNumber(change: Change): number | undefined {
+  if ("normal" in change) {
+    return change.ln2; // Normal changes have ln2
+  } else if ("add" in change) {
+    return change.ln; // Add changes have ln
+  } else if ("del" in change) {
+    return change.ln; // Del changes have ln
+  }
+  return undefined;
+}
+
+// Helper function to check if change is an addition or deletion
+function isAddOrDel(change: Change): boolean {
+  return "add" in change || "del" in change;
+}
+
+function createPrompt(
+  file: File,
+  chunk: Chunk,
+  prDetails: PRDetails,
+  fullFileContent?: string
+): string {
+  const contextSection = fullFileContent
+    ? `\nFull file context:\n\`\`\`\n${fullFileContent}\n\`\`\`\n`
+    : "";
+
+  // Get the line numbers that were actually changed
+  const changedLines = new Set(
+    chunk.changes
+      .filter(isAddOrDel)
+      .map(getLineNumber)
+      .filter((ln): ln is number => ln !== undefined)
+  );
+
+  return `You are an expert code reviewer focused on identifying only critical issues. Instructions:
 
 - Provide the response in following JSON format: {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review comment>"}]}
-- Focus ONLY on these categories:
-  1. Potential bugs, race conditions, or error handling issues
-  2. Security vulnerabilities or data safety concerns
-  3. Performance issues or scalability concerns
-  4. Architectural improvements that could significantly impact maintainability
-  5. Business logic concerns or edge cases that might be missed
-- Ignore minor style issues, formatting, or documentation suggestions
-- Only provide comments when you identify substantial issues that could impact code quality, security, or reliability
+- ONLY comment on the most critical issues that fall into these categories:
+  1. High-impact bugs that could cause system failures or data corruption
+  2. Critical security vulnerabilities that could lead to exploits
+  3. Severe performance issues that could cause system bottlenecks
+  4. Major architectural flaws that significantly impact maintainability
+  5. Critical business logic flaws that could lead to system misbehavior
+- You may only comment on the following changed line numbers: ${Array.from(
+    changedLines
+  ).join(", ")}
+- Completely ignore:
+  * Style issues or formatting
+  * Documentation
+  * Minor optimizations
+  * Naming conventions
+  * Code organization suggestions
+  * Any issue that isn't immediately critical
+- Only provide comments when you are highly confident (90%+) that the issue is severe
 - Write comments in GitHub Markdown format
-- Be direct and specific about the potential impact of each issue
+- Be direct and specific about the severe impact of each issue
+- If you don't find any critical issues, return an empty reviews array
 
 Review the following code diff in the file "${
     file.to
@@ -103,15 +152,12 @@ Pull request description:
 ---
 ${prDetails.description}
 ---
-
+${contextSection}
 Git diff to review:
 
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join("\n")}
+${chunk.changes.map((c) => `${getLineNumber(c) || ""} ${c.content}`).join("\n")}
 \`\`\`
 `;
 }
@@ -137,7 +183,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
         {
           role: "system",
           content:
-            "You are an expert code reviewer focused on identifying significant issues that could impact code quality, security, or reliability. Avoid minor stylistic suggestions.",
+            "You are an expert code reviewer. Only respond with the requested JSON format.",
         },
         {
           role: "user",
@@ -162,14 +208,27 @@ function createComment(
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
+  // Get the valid line numbers from the chunk
+  const validLines = new Set(
+    chunk.changes
+      .filter(isAddOrDel)
+      .map(getLineNumber)
+      .filter((ln): ln is number => ln !== undefined)
+  );
+
   return aiResponses.flatMap((aiResponse) => {
     if (!file.to) {
+      return [];
+    }
+    const lineNumber = Number(aiResponse.lineNumber);
+    // Only create comments for lines that were actually changed
+    if (!validLines.has(lineNumber)) {
       return [];
     }
     return {
       body: aiResponse.reviewComment,
       path: file.to,
-      line: Number(aiResponse.lineNumber),
+      line: lineNumber,
     };
   });
 }
@@ -187,6 +246,41 @@ async function createReviewComment(
     comments,
     event: "COMMENT",
   });
+}
+
+async function analyzeCode(
+  parsedDiff: File[],
+  prDetails: PRDetails
+): Promise<Array<{ body: string; path: string; line: number }>> {
+  const comments: Array<{ body: string; path: string; line: number }> = [];
+
+  for (const file of parsedDiff) {
+    if (file.to === "/dev/null") continue; // Ignore deleted files
+
+    const fullFileContent = await getFileContent(
+      prDetails.owner,
+      prDetails.repo,
+      file.to!,
+      `pull/${prDetails.pull_number}/head`
+    );
+
+    for (const chunk of file.chunks) {
+      const prompt = createPrompt(
+        file,
+        chunk,
+        prDetails,
+        fullFileContent || undefined
+      );
+      const aiResponse = await getAIResponse(prompt);
+      if (aiResponse) {
+        const newComments = createComment(file, chunk, aiResponse);
+        if (newComments) {
+          comments.push(...newComments);
+        }
+      }
+    }
+  }
+  return comments;
 }
 
 async function main() {
