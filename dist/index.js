@@ -175,7 +175,7 @@ function getAIResponse(prompt) {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
         const queryConfig = {
-            model: "gpt-4o-2024-11-20",
+            model: OPENAI_API_MODEL,
             temperature: 0.1,
             max_tokens: 1000,
             top_p: 1,
